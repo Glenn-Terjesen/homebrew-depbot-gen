@@ -1,8 +1,8 @@
 class DepbotGen < Formula
   desc "Scan git repos and generate GitHub Dependabot configuration"
   homepage "https://github.com/Glenn-Terjesen/homebrew-depbot-gen"
-  url "https://github.com/Glenn-Terjesen/homebrew-depbot-gen/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "6a6e0cbe40b2ecaf189f082ceec57039bb7d2cfce0b28a3a76c22895f97a8c0e"
+  url "https://github.com/Glenn-Terjesen/homebrew-depbot-gen/archive/refs/tags/v1.0.2.tar.gz"
+  sha256 "2dbf69611a899a119584dbe707597cadec760e537cb415849abecff6bbde0be2"
   license "MIT"
 
   depends_on "bash"
