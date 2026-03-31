@@ -14,7 +14,7 @@ brew install depbot-gen
 ### From source
 
 ```bash
-git clone https://github.com/Glenn-Terjesen/depbot-gen.git
+git clone https://github.com/Glenn-Terjesen/homebrew-depbot-gen.git
 cd depbot-gen
 make install
 ```
