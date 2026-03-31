@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (bash ${{ matrix.bash-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash-version: "system"
+          - os: macos-latest
+            bash-version: "brew"
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install bash via Homebrew (macOS)
+        if: matrix.bash-version == 'brew'
+        run: brew install bash
+
+      - name: Show bash version
+        run: bash --version | head -1
+
+      - name: Run tests
+        run: bash tests/test-depbot-gen.sh
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Lint depbot-gen
+        run: shellcheck depbot-gen
+
+      - name: Lint test script
+        run: shellcheck tests/test-depbot-gen.sh

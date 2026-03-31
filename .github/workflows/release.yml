@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  test:
+    name: Test before publish
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run tests
+        run: bash tests/test-depbot-gen.sh
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: [release-please, test]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+
+      - name: Calculate tarball SHA256
+        id: sha
+        run: |
+          tag="${{ needs.release-please.outputs.tag_name }}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          sha=$(curl -sL "$url" | shasum -a 256 | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        run: |
+          sed -i "s|url \".*\"|url \"${{ steps.sha.outputs.url }}\"|" Formula/depbot-gen.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${{ steps.sha.outputs.sha256 }}\"|" Formula/depbot-gen.rb
+
+      - name: Commit updated formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/depbot-gen.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update Homebrew formula for ${{ needs.release-please.outputs.tag_name }} [skip ci]"
+          git push

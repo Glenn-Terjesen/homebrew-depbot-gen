@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# Idea and source from : https://gist.github.com/heoelri/e8c1757c80f774ba9d0668cfc52afe35
+
+set -euo pipefail
+
+VERSION="1.0.0" # x-release-please-version
+MAX_DEPTH=5
+OUTPUT_FILE=".github/dependabot.yml"
+
+# --- Defaults (overridable via flags) ---
+SCHEDULE_INTERVAL="weekly"
+SCHEDULE_DAY="monday"
+SCHEDULE_TIME="09:00"
+SCHEDULE_TIMEZONE="UTC"
+PR_LIMIT=2
+COOLDOWN_DAYS=7
+DRY_RUN=false
+REGISTRY_URL=""
+REGISTRY_TYPE=""
+REGISTRY_TOKEN=""
+
+# --- Bash version check ---
+if (( BASH_VERSINFO[0] < 4 )); then
+  >&2 echo "Error: bash 4+ is required (found bash ${BASH_VERSION})."
+  >&2 echo "On macOS, install via: brew install bash"
+  exit 1
+fi
+
+# --- Usage ---
+usage() {
+  cat <<EOF
+Usage: depbot-gen [OPTIONS]
+
+Scans a git repository for package ecosystems and generates
+a .github/dependabot.yml configuration file.
+
+Options:
+  -h, --help              Show this help message
+  -v, --version           Show version
+  -n, --dry-run           Print generated config to stdout without writing
+  -t, --timezone ZONE     Timezone for schedule (default: UTC)
+  -s, --schedule INTERVAL Schedule interval: daily, weekly, monthly (default: weekly)
+  -d, --day DAY           Day of week for weekly schedule (default: monday)
+      --time TIME         Time of day in HH:MM format (default: 09:00)
+      --pr-limit N        Max open PRs per ecosystem (default: 2)
+      --cooldown N        Cooldown days between batches (default: 7)
+      --registry-url URL  Private registry URL (enables registry block)
+      --registry-type T   Registry type: npm-registry, maven-repository, etc.
+      --registry-token S  Registry token as secret ref, e.g. \${{secrets.MY_TOKEN}}
+
+Examples:
+  depbot-gen
+  depbot-gen --timezone America/New_York --schedule daily
+  depbot-gen --dry-run
+  depbot-gen --pr-limit 5 --cooldown 3
+  depbot-gen --registry-url https://npm.pkg.github.com --registry-type npm-registry --registry-token '\${{secrets.NPM_TOKEN}}'
+EOF
+}
+
+# --- Parse arguments ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "depbot-gen $VERSION"; exit 0 ;;
+    -n|--dry-run) DRY_RUN=true; shift ;;
+    -t|--timezone) SCHEDULE_TIMEZONE="$2"; shift 2 ;;
+    -s|--schedule) SCHEDULE_INTERVAL="$2"; shift 2 ;;
+    -d|--day) SCHEDULE_DAY="$2"; shift 2 ;;
+    --time) SCHEDULE_TIME="$2"; shift 2 ;;
+    --pr-limit) PR_LIMIT="$2"; shift 2 ;;
+    --cooldown) COOLDOWN_DAYS="$2"; shift 2 ;;
+    --registry-url) REGISTRY_URL="$2"; shift 2 ;;
+    --registry-type) REGISTRY_TYPE="$2"; shift 2 ;;
+    --registry-token) REGISTRY_TOKEN="$2"; shift 2 ;;
+    *)
+      >&2 echo "Unknown option: $1"
+      >&2 echo "Run 'depbot-gen --help' for usage."
+      exit 1
+      ;;
+  esac
+done
+
+# --- Validation ---
+
+if ! git rev-parse --is-inside-work-tree &> /dev/null; then
+  >&2 echo "Not a git repository."
+  exit 1
+fi
+if [ "$(git rev-parse --show-toplevel)" != "$(pwd -P)" ]; then
+  >&2 echo "Not in the root of the git repository."
+  exit 1
+fi
+
+# --- Ecosystem detection rules ---
+# Each entry: "pattern|ecosystem"
+# Order matters — first match wins per file.
+ECOSYSTEM_RULES=(
+  ".github/workflows/*.yml|github-actions"
+  ".github/workflows/*.yaml|github-actions"
+  "*.tf|terraform"
+  "*Chart.yaml|helm"
+  "*Dockerfile|docker"
+  "*package.json|npm"
+  "*build.gradle*|gradle"
+  "*pom.xml|maven"
+  "*.sln|nuget"
+  "*setup.py|pip"
+  "*pyproject.toml|pip"
+  "*requirements.txt|pip"
+  "*Cargo.toml|cargo"
+  "*go.mod|gomod"
+  "*Package.swift|swift"
+)
+
+# --- Functions ---
+
+detect_ecosystem() {
+  local file=$1
+  for rule in "${ECOSYSTEM_RULES[@]}"; do
+    local pattern="${rule%|*}"
+    local ecosystem="${rule#*|}"
+    # shellcheck disable=SC2254
+    case "$file" in ./$pattern) echo "$ecosystem"; return ;; esac
+  done
+}
+
+resolve_path() {
+  local file=$1
+  local relPath
+  relPath=$(dirname "$file")
+  # Strip leading ./
+  relPath="${relPath#./}"
+  if [[ $relPath == "." || -z $relPath ]]; then
+    echo "/"
+    return
+  fi
+  # Cap at MAX_DEPTH directory levels
+  IFS='/' read -ra parts <<< "$relPath"
+  if [ ${#parts[@]} -gt "$MAX_DEPTH" ]; then
+    relPath=$(IFS='/'; echo "${parts[*]:0:$MAX_DEPTH}")
+  fi
+  echo "/${relPath}"
+}
+
+format_directories() {
+  echo "$1" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/  - /'
+}
+
+render_ecosystem() {
+  local ecosystem=$1
+  local directories=$2
+  local registry=${3:-}
+  local dir_block
+  dir_block=$(format_directories "$directories")
+
+  if [[ $ecosystem == "terraform" ]]; then
+    cat <<EOF
+- package-ecosystem: terraform
+  directories:
+${dir_block}
+  schedule:
+    interval: "daily"
+    time: "${SCHEDULE_TIME}"
+    timezone: "${SCHEDULE_TIMEZONE}"
+  open-pull-requests-limit: 0  # Security-updates only
+  cooldown:
+    days: ${COOLDOWN_DAYS}
+EOF
+    return
+  fi
+
+  cat <<EOF
+- package-ecosystem: "$ecosystem"
+  directories:
+${dir_block}
+EOF
+
+  if [[ -n $registry ]]; then
+    cat <<EOF
+  registries:
+    - $registry
+  groups:
+    minor-and-patch:
+      applies-to: version-updates
+      update-types:
+      - "minor"
+      - "patch"
+    major-updates:
+      applies-to: version-updates
+      update-types:
+      - "major"
+EOF
+  else
+    cat <<EOF
+  groups:
+    minor-and-patch:
+      applies-to: version-updates
+      update-types:
+      - "minor"
+      - "patch"
+EOF
+  fi
+
+  cat <<EOF
+  schedule:
+    interval: "${SCHEDULE_INTERVAL}"
+    time: "${SCHEDULE_TIME}"
+    timezone: "${SCHEDULE_TIMEZONE}"
+EOF
+
+  if [[ $SCHEDULE_INTERVAL == "weekly" ]]; then
+    echo "    day: \"${SCHEDULE_DAY}\""
+  fi
+
+  cat <<EOF
+  open-pull-requests-limit: ${PR_LIMIT}
+  cooldown:
+    days: ${COOLDOWN_DAYS}
+EOF
+}
+
+# --- Main ---
+
+echo "Scanning for software ecosystems in this repository..."
+
+declare -a files=()
+while IFS= read -r -d '' file; do
+  files+=("$file")
+done < <(find . -type f \
+  -not -path "*.git/*" \
+  -not -path "*node_modules*" \
+  -not -path "*/charts/*" \
+  -not -path "*.terraform*" \
+  -not -path "*dependabot.yml" \
+  -not -path "*.venv/*" \
+  -not -path "*/venv/*" \
+  -print0
+)
+
+declare -A dirarr
+
+# Build registry block from flags
+has_registry=false
+registry_block=""
+if [[ -n $REGISTRY_URL && -n $REGISTRY_TYPE ]]; then
+  has_registry=true
+  registry_block="registries:"
+  registry_block+="\n  private-registry:"
+  registry_block+="\n    type: ${REGISTRY_TYPE}"
+  registry_block+="\n    url: \"${REGISTRY_URL}\""
+  if [[ -n $REGISTRY_TOKEN ]]; then
+    registry_block+="\n    token: ${REGISTRY_TOKEN}"
+  fi
+fi
+
+# Scan files and map to ecosystems
+for file in "${files[@]}"; do
+  ecosystem=$(detect_ecosystem "$file") || true
+  [[ -z ${ecosystem:-} ]] && continue
+
+  relPath=$(resolve_path "$file")
+
+  if ! printf '%s\n' "${dirarr[$ecosystem]:-}" | grep -qw "$relPath"; then
+    dirarr["$ecosystem"]+="$relPath "
+  fi
+done
+
+if [ ${#dirarr[@]} -eq 0 ]; then
+  >&2 echo "No software ecosystems found in this repository."
+  exit 1
+fi
+
+# Build output
+output="---\nversion: 2"
+[[ -n $registry_block ]] && output+="\n${registry_block}"
+output+="\nupdates:"
+
+for ecosystem in "${!dirarr[@]}"; do
+  directories=$(echo "${dirarr[$ecosystem]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+  echo "  Added $ecosystem"
+  if [[ $has_registry == true && ( $ecosystem == "npm" || $ecosystem == "gradle" || $ecosystem == "maven" || $ecosystem == "pip" || $ecosystem == "cargo" || $ecosystem == "gomod" ) ]]; then
+    block=$(render_ecosystem "$ecosystem" "$directories" "private-registry")
+  else
+    block=$(render_ecosystem "$ecosystem" "$directories")
+  fi
+  output+="\n$block"
+done
+
+# Output
+if [[ $DRY_RUN == true ]]; then
+  echo ""
+  echo -e "$output"
+else
+  mkdir -p .github
+  echo -e "$output" > "$OUTPUT_FILE"
+  echo ""
+  echo "Generated $OUTPUT_FILE"
+fi
